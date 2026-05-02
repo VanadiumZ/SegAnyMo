@@ -128,7 +128,8 @@ def process_points_with_memory(state, predictor, t_cano, initial_obj_id, traj, c
             'pts_trajs': mem_pts[prompt_mask],
             'confi_trajs': mem_confi[prompt_mask],
             'vis_trajs': mem_vis[prompt_mask],
-            'num': int(in_mask.sum())
+            'num': int(in_mask.sum()),
+            'cano_dyn_mask': mask_sam[0],  # H×W bool ndarray: SAM2 dynamic mask at canonical frame
         }
 
     # 6. Retain points outside the mask (visible points outside mask) + invisible points
@@ -342,6 +343,109 @@ def save_video_from_images3(rgb_images, mask_images, video_dir, fps=30):
     mask_writer.close()
     mask_rgb_writer.close()
     mask_rgb_color_writer.close()
+
+def save_combined_mask_video(rgb_images, dyn_masks, static_masks, video_dir, fps=30):
+    """Save a single video with dynamic mask (red) and static mask (blue) overlaid."""
+    assert len(rgb_images) > 0, "图像列表不能为空"
+    os.makedirs(video_dir, exist_ok=True)
+    video_path = os.path.join(video_dir, "combined_mask_rgb_color.mp4")
+    writer = get_writer(video_path, fps=fps)
+
+    dyn_color  = np.array([255,  80,  80], dtype=np.float32)   # red   – dynamic
+    stat_color = np.array([ 80,  80, 255], dtype=np.float32)   # blue  – static
+    alpha = 0.5
+
+    for rgb_img, dyn_m, stat_m in zip(rgb_images, dyn_masks, static_masks):
+        frame = rgb_img.copy().astype(np.float32)
+        dyn_m  = dyn_m.astype(bool)
+        stat_m = stat_m.astype(bool)
+        if dyn_m.any():
+            frame[dyn_m]  = alpha * dyn_color  + (1 - alpha) * frame[dyn_m]
+        if stat_m.any():
+            frame[stat_m] = alpha * stat_color + (1 - alpha) * frame[stat_m]
+        writer.append_data(frame.clip(0, 255).astype(np.uint8))
+
+    writer.close()
+    print(f'Combined video saved to {video_dir}!')
+
+def extract_frame(args, frame_names, all_dyn_mask, static_ref, frame_ratio=0.5):
+    """Extract one frame and save image + mask arrays."""
+    video_name = os.path.basename(args.dynamic_dir)
+    if "baseline" in args.output_mask_dir:
+        w_pred_dir = os.path.join(args.output_mask_dir, video_name)
+        dynamic_path = os.path.join(os.path.dirname(args.output_mask_dir), "final_res", video_name)
+    else:
+        w_pred_dir = os.path.join(args.output_mask_dir, "initial_preds", video_name)
+        dynamic_path = os.path.join(args.output_mask_dir, "final_res", video_name)
+
+    T = len(frame_names)
+    if T == 0:
+        raise RuntimeError("No frames found for extraction.")
+    frame_idx = max(0, min(int(round(frame_ratio * (T - 1))), T - 1))
+    frame_name = frame_names[frame_idx]
+    print(f"[extract_frame] frame {frame_idx}/{T-1} (ratio={frame_ratio:.3f}): {frame_name}")
+
+    out_dir = os.path.join(dynamic_path, "extracted_frames", frame_name)
+    os.makedirs(out_dir, exist_ok=True)
+
+    rgb_img = None
+    for ext in [".png", ".jpg", ".jpeg", ".PNG", ".JPG", ".JPEG"]:
+        p = os.path.join(args.video_dir, f"{frame_name}{ext}")
+        if os.path.exists(p):
+            rgb_img = cv2.cvtColor(cv2.imread(p), cv2.COLOR_BGR2RGB)
+            break
+    if rgb_img is None:
+        raise FileNotFoundError(f"No image for frame '{frame_name}' in {args.video_dir}")
+    Image.fromarray(rgb_img).save(os.path.join(out_dir, "frame.png"))
+    np.save(os.path.join(out_dir, "frame.npy"), rgb_img)
+    height, width = rgb_img.shape[:2]
+
+    if frame_idx < len(all_dyn_mask):
+        D = all_dyn_mask[frame_idx].numpy().astype(bool)
+    else:
+        D = np.zeros((height, width), dtype=bool)
+
+    if static_ref is None:
+        static_ref = np.zeros((height, width), dtype=bool)
+
+    # Save D (full union dynamic mask) for this frame
+    save_ann_png(os.path.join(out_dir, "dynamic_mask.png"), D.astype(np.uint8), DAVIS_PALETTE)
+    np.save(os.path.join(out_dir, "dynamic_mask.npy"), D.astype(np.uint8))
+
+    # static mask: step1 = static_ref ∩ D_t, step2 = static_ref − step1 = static_ref & ~D_t
+    intersection = static_ref & D
+    static_mask  = static_ref & ~intersection   # equivalent to static_ref & ~D
+    save_ann_png(os.path.join(out_dir, "mask0.png"), static_mask.astype(np.uint8), DAVIS_PALETTE)
+    np.save(os.path.join(out_dir, "mask0.npy"), static_mask.astype(np.uint8))
+
+    # per-object dynamic masks
+    w_path = os.path.join(w_pred_dir, f"{frame_name}.png")
+    mask_idx = 1
+    if os.path.exists(w_path):
+        W_palette, _ = load_ann_png(w_path)
+        obj_ids = sorted(np.unique(W_palette[W_palette > 0]).tolist())
+        for obj_id in obj_ids:
+            dyn_obj = (W_palette == obj_id) & D
+            if dyn_obj.any():
+                save_ann_png(
+                    os.path.join(out_dir, f"mask{mask_idx}.png"),
+                    dyn_obj.astype(np.uint8),
+                    DAVIS_PALETTE,
+                )
+                np.save(os.path.join(out_dir, f"mask{mask_idx}.npy"), dyn_obj.astype(np.uint8))
+                mask_idx += 1
+
+    if mask_idx == 1 and D.any():
+        save_ann_png(os.path.join(out_dir, "mask1.png"), D.astype(np.uint8), DAVIS_PALETTE)
+        np.save(os.path.join(out_dir, "mask1.npy"), D.astype(np.uint8))
+        mask_idx = 2
+
+    print(f"[extract_frame] saved to: {out_dir}")
+    print("  frame.png / frame.npy")
+    print("  dynamic_mask.png / dynamic_mask.npy  – full dynamic mask (D)")
+    print("  mask0.png / mask0.npy  – static mask (static_ref − static_ref∩D)")
+    for j in range(1, mask_idx):
+        print(f"  mask{j}.png / mask{j}.npy – per-object dynamic mask")
 
 def save_video_from_images2(rgb_images, mask_images, video_dir, fps=30):
     assert len(rgb_images) > 0 and len(mask_images) > 0, "图像列表不能为空"
@@ -599,7 +703,9 @@ def main(args):
         # output_mask_dir = os.path.dirname(args.output_mask_dir)
     else:
         output_mask_dir = os.path.join(args.output_mask_dir, "initial_preds")
-    
+
+    dyn_segments = {}  # populated below when cal_only=False; empty dict used as fallback
+
     if not args.cal_only:
         checkpoint = "sam2/checkpoints/sam2_hiera_large.pt"
         model_cfg = "sam2_hiera_l.yaml"
@@ -638,6 +744,7 @@ def main(args):
             exit()
 
         video_segments = {}  # video_segments contains the per-frame segmentation results
+        dyn_segments = {}   # per-frame dynamic mask D (SAM2 canonical mask propagated)
         for obj_id_valid, pkg in memory_dict.items():
             q_ts = list(range(0, T, 16))
             predictor.reset_state(state)
@@ -717,6 +824,28 @@ def main(args):
                         else:
                             video_segments[out_frame_idx][out_obj_id] = video_segments[out_frame_idx][out_obj_id] | (out_mask_logits[i] > 0.0).cpu().numpy()
 
+            # ── D: second propagation using canonical-frame mask_sam as mask prompt ──
+            cano_dyn_mask = pkg.get('cano_dyn_mask')
+            if cano_dyn_mask is not None:
+                predictor.reset_state(state)
+                predictor.add_new_mask(
+                    inference_state=state,
+                    frame_idx=pkg['time'],
+                    obj_id=obj_id_valid,
+                    mask=torch.from_numpy(cano_dyn_mask),
+                )
+                for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(state):
+                    dyn_m = (out_mask_logits[0] > 0.0).cpu().numpy().reshape(height, width)
+                    if out_frame_idx not in dyn_segments:
+                        dyn_segments[out_frame_idx] = np.zeros((height, width), dtype=bool)
+                    dyn_segments[out_frame_idx] |= dyn_m
+                if pkg['time'] != 0:
+                    for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(state, reverse=True):
+                        dyn_m = (out_mask_logits[0] > 0.0).cpu().numpy().reshape(height, width)
+                        if out_frame_idx not in dyn_segments:
+                            dyn_segments[out_frame_idx] = np.zeros((height, width), dtype=bool)
+                        dyn_segments[out_frame_idx] |= dyn_m
+
         video_segments = dict(sorted(video_segments.items()))
         # write the output masks as palette PNG files to output_mask_dir
         save_dirname = os.path.join(output_mask_dir, basename)
@@ -765,17 +894,54 @@ def main(args):
             glob(os.path.join(seq_mask_dir, "*.jpg")) + sorted(glob(os.path.join(seq_mask_dir, "*.jpeg")))
     )
     
+    # height/width may not be set when cal_only=True; derive lazily from first mask
+    if 'height' not in dir() or 'width' not in dir():
+        height = width = None
+
     all_mask = []
-    for d_path in mask_paths:
-        # d_path = os.path.join(sam_dir, f'{frame_name}.png')
+    all_dyn_mask = []    # D per frame
+    all_static_mask = [] # static mask per frame (derived from reference frame)
+    static_ref = None
+    ref_frame_idx = min(2, max(len(mask_paths) - 1, 0))  # use the 3rd frame if available
+    pre_ref_D = []       # stash D for frames before reference, to backfill later
+    for i, d_path in enumerate(mask_paths):
         if not os.path.exists(d_path):
+            if height is None:
+                raise RuntimeError(f"Cannot determine image size: {d_path} missing and height/width unknown.")
             mask_img = np.zeros((height, width), dtype=np.uint8)
         else:
             mask_img, p = load_ann_png(d_path)
+            if height is None:
+                height, width = mask_img.shape[:2]
         mask_img = (mask_img > 0).astype(np.uint8)
         mask_tensor = torch.from_numpy(mask_img)
         all_mask.append(mask_tensor)
+
+        W = mask_img.astype(bool)
+        D = dyn_segments.get(i, np.zeros((height, width), dtype=bool))
+        all_dyn_mask.append(torch.from_numpy(D.astype(np.uint8)))
+
+        if i < ref_frame_idx:
+            pre_ref_D.append(D)
+            all_static_mask.append(None)
+            continue
+
+        if i == ref_frame_idx:
+            static_ref = W & ~D
+            # backfill frames before reference
+            for j, prev_D in enumerate(pre_ref_D):
+                all_static_mask[j] = torch.from_numpy((static_ref & ~prev_D).astype(np.uint8))
+            pre_ref_D = None
+
+        static_mask = static_ref & ~D
+        all_static_mask.append(torch.from_numpy(static_mask.astype(np.uint8)))
     predict_mask = torch.stack(all_mask, dim=0)
+
+    # Optional fast path: only extract one frame/masks, skip all video generation
+    if args.extract_only:
+        ratio = args.extract_frame if args.extract_frame is not None else 0.5
+        extract_frame(args, frame_names, all_dyn_mask, static_ref, frame_ratio=ratio)
+        return
 
     # save video
     rgb_p_example = os.listdir(args.video_dir)[0] 
@@ -796,6 +962,15 @@ def main(args):
     
     save_video_from_images3(rgbs, np_masks, save_dir)
 
+    # Combined visualization: dynamic (red) + static (blue) in a single video
+    np_dyn    = [m.numpy() for m in all_dyn_mask]
+    np_static = [m.numpy() for m in all_static_mask]
+    save_combined_mask_video(rgbs, np_dyn, np_static, os.path.join(dynamic_path, "combined_mask_video"))
+
+    # Optional: extract a specific frame
+    if args.extract_frame is not None:
+        extract_frame(args, frame_names, all_dyn_mask, static_ref, frame_ratio=args.extract_frame)
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Train trajectory-based motion segmentation network',
                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -805,7 +980,17 @@ if __name__ == "__main__":
     parser.add_argument('--vis', action="store_true")
     parser.add_argument('--gt_dir', type=str,default="current-data-dir/davis/DAVIS/Annotations/480p/a")  
     parser.add_argument('--cal_only', action="store_true")
-    
+    parser.add_argument('--extract_frame', type=float, nargs='?', const=0.5, default=None,
+                        metavar='RATIO',
+                        help='Extract a frame by position ratio 0-1 (omit value to use default 0.5). '
+                             'Outputs frame/frame masks as both .png and .npy arrays: '
+                             'mask0 is static, mask1... are per-object dynamic masks. '
+                             'in final_res/<video>/extracted_frames/<frame_name>/. '
+                             'Can be combined with --cal_only to skip re-running SAM2.')
+    parser.add_argument('--extract_only', action='store_true',
+                        help='Only extract frame/mask arrays and skip video generation. '
+                             'If --extract_frame is omitted, defaults to ratio 0.5.')
+
     args = parser.parse_args()
         
     main(args)

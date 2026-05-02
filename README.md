@@ -22,6 +22,7 @@ This repository contains the code for Segment Any Motion in Videos.
 
 - [Installation](#installation)
 - [Usage](#usage)
+  - [Full pipeline (`example.sh`)](#full-pipeline-examplesh)
   - [Preprocessing](#preprocessing)
   - [Tracks Label Prediction](#tracks-label-prediction)
   - [Mask Densification Using SAM2](#mask-densification-using-sam2)
@@ -94,6 +95,49 @@ python core/utils/run_inference.py --data_dir ./data/images --sam2dir ./result/s
 # or use --video_path ./data/video.mp4
 ```
 Please see below for specific usage details.
+
+### Full pipeline (`example.sh`)
+The script [`example.sh`](example.sh) runs the same three stages as above in order, then **exports a single frame with masks** and optionally **removes intermediate MP4 outputs** so you keep only images and `.npy` artifacts.
+
+**Run:**
+
+```bash
+bash example.sh
+```
+
+**Environment variables** (all optional; defaults match the script):
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `VIDEO_PATH` | Unset: default in `example.sh` (edit to your `frame.mp4` or export this var) | Input video to process. |
+| `GPU_ID` | `0` | CUDA device id passed to `run_inference.py`. |
+| `STEP` | `10` | Frame stride for query frames (same as `--step`). |
+| `CONFIG_FILE` | `./configs/example.yaml` | Config for motion segmentation; must set a valid `resume_path` to your checkpoint. |
+| `OUTPUT_ROOT` | `./result` | Root folder for this run’s outputs. |
+| `USE_EFFICIENCY` | `0` | Set to `1` to append `--e` (efficiency mode) to all steps. |
+| `EXTRACT_FRAME` | `0.5` | Normalized time in \([0,1]\): which frame to export after SAM2 (`--extract_only --extract_frame`). |
+| `CLEAN_VIDEO_OUTPUTS` | `1` | Set to `0` to keep MP4s under moseg/SAM2; `1` deletes pipeline-generated videos after extraction. |
+
+**Pipeline steps:**
+
+1. **Preprocessing** — `run_inference.py` with `--depths --tracks --dinos` on `VIDEO_PATH`. Produces depth, TAPIR tracks, and DINO features under the repo’s standard layout (see [Preprocessing](#preprocessing)).
+2. **Motion segmentation (Moseg)** — `run_inference.py --motion_seg_infer` with `--motin_seg_dir "${OUTPUT_ROOT}/moseg_<video_stem>"` and `--config_file`. Writes dynamic/static predictions and visualizations for that sequence.
+3. **SAM2 + single-frame export** — `run_inference.py --sam2` with `--sam2dir "${OUTPUT_ROOT}/sam2_<video_stem>"`, reusing `--motin_seg_dir` from step 2, plus **`--extract_only --extract_frame`** so the run **does not rely on keeping full mask videos** as the final deliverable; it materializes one RGB frame and aligned masks.
+4. **Optional cleanup** — If `CLEAN_VIDEO_OUTPUTS=1`, removes `original.mp4` / `dynamic.mp4` under the moseg sequence folder and `*.mp4` under SAM2 `video/` and `combined_mask_video/` for that sequence.
+
+**Where to find results** (after a successful run; `<SEQ>` is the input filename without extension):
+
+- **Exported frame and masks:** `${OUTPUT_ROOT}/sam2_<SEQ>/extracted_frames/<SEQ>/`
+  - `frame.png` (and `frame.npy`)
+  - `dynamic_mask.png` (`.npy`) — aggregated dynamic mask
+  - `mask0.png` (`.npy`) — static region mask
+  - `mask1*.png` (`.npy`) — per moving object masks
+
+Example with overrides:
+
+```bash
+VIDEO_PATH=/path/to/video.mp4 GPU_ID=0 EXTRACT_FRAME=0.3 CLEAN_VIDEO_OUTPUTS=1 bash example.sh
+```
 
 ### Preprocessing
 We depend on the following third-party libraries for preprocessing:

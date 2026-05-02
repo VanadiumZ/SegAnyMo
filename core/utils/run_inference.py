@@ -98,6 +98,15 @@ def main(
         img_dirs_root = args.data_dir
         data_dir = os.path.dirname(img_dirs_root)
         img_names = sorted(os.listdir(img_dirs_root))
+
+    # filter to specific sequences if requested
+    seq_filter = getattr(args, 'seq_names', None)
+    if seq_filter:
+        img_names = [n for n in img_names if n in seq_filter]
+        if not img_names:
+            list_dir = data_dir if (stereo or waymo) else args.data_dir
+            print(f"[WARN] No sequences matched --seq_names {seq_filter}. Available: {sorted(os.listdir(list_dir))}")
+            return
     
     with ProcessPoolExecutor(max_workers=len(gpus)) as exe:
         for i, img_name in enumerate(img_names):
@@ -185,7 +194,8 @@ def main(
                 gt_dir = os.path.join(gt_root, img_name)
                 
             motin_seg_dir = args.motin_seg_dir
-            if args.motion_seg_infer:
+            seq_motion_seg_dir = os.path.join(motin_seg_dir, img_name)
+            if args.motion_seg_infer and not (os.path.exists(seq_motion_seg_dir) and os.listdir(seq_motion_seg_dir)):
                 cmd = (
                     f"CUDA_VISIBLE_DEVICES={dev_id} python {current_work_dir}/inference.py "
                     f"--imgs_dir {img_dir} --save_dir {motin_seg_dir} "
@@ -197,17 +207,34 @@ def main(
                     cmd += f"--gt_dir {gt_dir} "
 
                 exe.submit(subprocess.call, cmd, shell=True)
+            elif args.motion_seg_infer:
+                print(f"Skipping motion seg inference for {img_name}, results already exist in {seq_motion_seg_dir}")
                 
             # run SAM2
             if args.sam2:
                 dynamic_dir = os.path.join(motin_seg_dir, img_name)
-                cmd = (
-                    f"CUDA_VISIBLE_DEVICES={dev_id} python {current_work_dir}/sam2/run_sam2.py "
-                    f"--video_dir {img_dir} --dynamic_dir {dynamic_dir} "
-                    f"--output_mask_dir {args.sam2dir} "
-                    f"--gt_dir {gt_dir} "
-                )
-                exe.submit(subprocess.call, cmd, shell=True)
+                if "baseline" in args.sam2dir:
+                    sam2_done_dir = os.path.join(args.sam2dir, img_name)
+                else:
+                    sam2_done_dir = os.path.join(args.sam2dir, "initial_preds", img_name)
+                if os.path.exists(sam2_done_dir) and os.listdir(sam2_done_dir):
+                    print(f"Skipping SAM2 for {img_name}, results already exist in {sam2_done_dir}")
+                else:
+                    cmd = (
+                        f"CUDA_VISIBLE_DEVICES={dev_id} python {current_work_dir}/sam2/run_sam2.py "
+                        f"--video_dir {img_dir} --dynamic_dir {dynamic_dir} "
+                        f"--output_mask_dir {args.sam2dir} "
+                        f"--gt_dir {gt_dir} "
+                    )
+                    if args.extract_only:
+                        cmd += "--extract_only "
+                        if args.extract_frame is not None:
+                            cmd += f"--extract_frame {args.extract_frame} "
+                        else:
+                            cmd += "--extract_frame "
+                    elif args.extract_frame is not None:
+                        cmd += f"--extract_frame {args.extract_frame} "
+                    exe.submit(subprocess.call, cmd, shell=True)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="inference")
@@ -230,6 +257,15 @@ if __name__ == "__main__":
     # sam2 inference
     parser.add_argument("--sam2", action='store_true')
     parser.add_argument("--sam2dir", type=str, default="./output/sam2/sintel", help="save sam2 pred")
+    # frame extraction (forwarded to run_sam2.py)
+    parser.add_argument('--extract_frame', type=float, nargs='?', const=0.5, default=None,
+                        metavar='RATIO',
+                        help='Extract a frame by position ratio 0-1 (default 0.5). '
+                             'Saves frame/masks as .png and .npy.')
+    parser.add_argument('--extract_only', action='store_true',
+                        help='Only extract frame/mask arrays, skip video generation.')
+    parser.add_argument('--seq_names', nargs='+', type=str, default=None,
+                        help='Process only these sequence names (subdirectory names under data_dir).')
     args = parser.parse_args()
 
     # if input is video
@@ -240,6 +276,9 @@ if __name__ == "__main__":
         if not os.path.exists(output_dir):
             video_to_images(args.video_path, output_dir, args.e)
         args.data_dir = img_dir
+        # automatically restrict to just the specified video
+        if args.seq_names is None:
+            args.seq_names = [seq_name]
 
     # if efficiency, change resolution
     if args.e:
